@@ -1,4 +1,4 @@
-!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 headtls.py - HTTP security headers + TLS certificate scanner
 
