@@ -27,14 +27,18 @@ Autor: **@BelisarioGM**
 
 ---
 
-## 🛠️ Requisitos
-
-- Python 3.9+
-- Librerías indicadas en `requirements.txt`
-
 Instalación rápida:
 
 ```bash
+git clone https://github.com/BelisarioGM/HeadTLS.git
+cd HeadTLS
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+Ejecución:
+
+```bash
+python headtls.py -u <IP/URL>
+```
