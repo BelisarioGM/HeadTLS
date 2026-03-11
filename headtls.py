@@ -18,11 +18,15 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import warnings
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlparse
+import zipfile
+import tarfile
 
 # Silence DeprecationWarnings (e.g. ssl.TLSVersion.TLSv1 is deprecated)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -246,6 +250,115 @@ def download_update(download_url: str, timeout: int = 20) -> str:
                 if chunk:
                     f.write(chunk)
     return filename
+
+def _extract_archive(archive_path: str, dest_dir: str) -> str:
+    apath = Path(archive_path)
+    if apath.suffix == ".zip":
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(dest_dir)
+    elif apath.suffixes[-2:] == [".tar", ".gz"] or apath.suffix == ".tgz":
+        with tarfile.open(archive_path, "r:*") as tf:
+            tf.extractall(dest_dir)
+    else:
+        raise ValueError(f"Unsupported archive format: {archive_path}")
+
+    entries = [p for p in Path(dest_dir).iterdir()]
+    if len(entries) == 1 and entries[0].is_dir():
+        return str(entries[0])
+    return dest_dir
+
+def _file_bytes(path: Path) -> bytes:
+    with path.open("rb") as f:
+        return f.read()
+
+def apply_update_from_archive(archive_path: str, project_root: str) -> Dict[str, List[str]]:
+    updated: List[str] = []
+    added: List[str] = []
+    skipped: List[str] = []
+
+    project_root_path = Path(project_root).resolve()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extracted_root = Path(_extract_archive(archive_path, tmpdir)).resolve()
+        for src in extracted_root.rglob("*"):
+            if src.is_dir():
+                continue
+            rel = src.relative_to(extracted_root)
+            if any(part in {".git", "__pycache__", ".venv", "venv"} for part in rel.parts):
+                continue
+
+            dst = project_root_path / rel
+            try:
+                src_bytes = _file_bytes(src)
+            except Exception:
+                continue
+
+            if dst.exists():
+                try:
+                    dst_bytes = _file_bytes(dst)
+                except Exception:
+                    dst_bytes = None
+                if dst_bytes == src_bytes:
+                    skipped.append(str(rel))
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with dst.open("wb") as f:
+                    f.write(src_bytes)
+                updated.append(str(rel))
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with dst.open("wb") as f:
+                    f.write(src_bytes)
+                added.append(str(rel))
+
+    return {"updated": updated, "added": added, "skipped": skipped}
+
+def run_update_flow(current_version: str, repo_slug: str = REPO_SLUG) -> None:
+    print("\n[Update]")
+    info = check_for_updates(current_version, repo_slug)
+    if info.details:
+        print(f"{YELLOW}{ICON_WARN} {info.details}{RESET}")
+        return
+    if not info.available:
+        print(f"{GREEN}{ICON_OK} You are on the latest version ({info.current_version}).{RESET}")
+        return
+    if not info.download_url:
+        print(f"{ICON_INFO} No download URL available for the latest release.{RESET}")
+        return
+
+    print(f"{YELLOW}{ICON_WARN} New version available: {info.latest_version} (current: {info.current_version}){RESET}")
+    try:
+        saved = download_update(info.download_url)
+        print(f"{GREEN}{ICON_OK} Update downloaded: {saved}{RESET}")
+        changes = apply_update_from_archive(saved, str(Path(__file__).resolve().parent))
+        print(f"{GREEN}{ICON_OK} Updated files: {len(changes['updated'])}{RESET}")
+        if changes["updated"]:
+            print("Updated list:")
+            for item in changes["updated"]:
+                print(f" - {item}")
+        print(f"{GREEN}{ICON_OK} Added files: {len(changes['added'])}{RESET}")
+        if changes["added"]:
+            print("Added list:")
+            for item in changes["added"]:
+                print(f" - {item}")
+        print(f"{ICON_INFO} Unchanged files: {len(changes['skipped'])}{RESET}")
+        if changes["skipped"]:
+            print("Unchanged list:")
+            for item in changes["skipped"]:
+                print(f" - {item}")
+    except Exception as e:
+        print(f"{RED}{ICON_FAIL} Update failed: {e}{RESET}")
+
+def run_update_check_flow(current_version: str, repo_slug: str = REPO_SLUG) -> None:
+    print("\n[Update Check]")
+    info = check_for_updates(current_version, repo_slug)
+    if info.details:
+        print(f"{YELLOW}{ICON_WARN} {info.details}{RESET}")
+        return
+    if info.available:
+        print(f"{YELLOW}{ICON_WARN} New version available: {info.latest_version} (current: {info.current_version}){RESET}")
+    else:
+        print(f"{GREEN}{ICON_OK} You are on the latest version ({info.current_version}).{RESET}")
 
 def detect_technologies(http: Dict[str, Any]) -> List[Dict[str, str]]:
     headers = http.get("headers", {}) or {}
@@ -529,12 +642,26 @@ def pretty_summary(report: Dict[str, Any]) -> None:
 # --- MAIN
 def main():
     p = argparse.ArgumentParser(description="HTTP headers + TLS certificate scanner (author: @BelisarioGM)")
-    p.add_argument("-u", "--url", required=True, help="Target URL or IP (e.g. https://example.com)")
+    p.add_argument("-u", "--url", help="Target URL or IP (e.g. https://example.com)")
     p.add_argument("-o", "--output", help="JSON output file to save results")
     p.add_argument("--summary", action="store_true", help="Show simplified summary output (default)")
     p.add_argument("--ports", default="443", help="Comma-separated list of ports to test TLS (default: 443)")
-    p.add_argument("--check-update", action="store_true", help="Check if a newer version is available on GitHub")
+    p.add_argument("--update-check", action="store_true", help="Check if a newer version is available on GitHub")
+    p.add_argument("--update", action="store_true", help="Update HeadTLS to the latest GitHub release")
     args = p.parse_args()
+
+    if args.update_check:
+        run_update_check_flow(__version__, REPO_SLUG)
+        if not args.url and not args.update:
+            return
+
+    if args.update:
+        run_update_flow(__version__, REPO_SLUG)
+        if not args.url:
+            return
+
+    if not args.url:
+        p.error("the following arguments are required: -u/--url (unless using --update-check or --update only)")
 
     ports = [int(x.strip()) for x in args.ports.split(",") if x.strip().isdigit()]
 
@@ -558,29 +685,7 @@ def main():
         except Exception as e:
             print("Error saving JSON:", e, file=sys.stderr)
 
-    if args.check_update:
-        print("\n[Update Check]")
-        info = check_for_updates(__version__, REPO_SLUG)
-        if info.details:
-            print(f"{YELLOW}{ICON_WARN} {info.details}{RESET}")
-            return
-        if info.available:
-            print(f"{YELLOW}{ICON_WARN} New version available: {info.latest_version} (current: {info.current_version}){RESET}")
-            if info.download_url:
-                try:
-                    choice = input("Download update now? [y/N]: ").strip().lower()
-                except EOFError:
-                    choice = "n"
-                if choice == "y":
-                    try:
-                        saved = download_update(info.download_url)
-                        print(f"{GREEN}{ICON_OK} Update downloaded: {saved}{RESET}")
-                    except Exception as e:
-                        print(f"{RED}{ICON_FAIL} Download failed: {e}{RESET}")
-            else:
-                print(f"{ICON_INFO} No download URL available for the latest release.")
-        else:
-            print(f"{GREEN}{ICON_OK} You are on the latest version ({info.current_version}).{RESET}")
+    # Update is handled above when --update is provided.
 
 if __name__ == "__main__":
     main()

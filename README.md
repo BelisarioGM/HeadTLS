@@ -25,7 +25,7 @@ Author: **@BelisarioGM**
 - Detects web technologies from headers and HTML content (basic fingerprinting).
 - Searches detected technologies in `searchsploit` (if installed).
 - Evaluates **clickjacking** exposure (`X-Frame-Options` / `CSP frame-ancestors`).
-- Checks if a newer version is available on GitHub and can download it on demand.
+- Updates to the latest GitHub release and only overwrites files that changed.
 - Output:
   - **Console summary** (default).
   - **Structured JSON** (with `-o output.json`).
@@ -53,5 +53,6 @@ Useful options:
 ```bash
 python headtls.py -u <IP/URL> --ports 443,8443 --summary
 python headtls.py -u <IP/URL> -o output.json
-python headtls.py -u <IP/URL> --check-update
+python headtls.py --update-check
+python headtls.py --update
 ```
