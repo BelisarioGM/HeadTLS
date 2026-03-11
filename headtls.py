@@ -12,16 +12,23 @@ Author: @BelisarioGM
 from __future__ import annotations
 import argparse
 import json
+import re
+import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 # Silence DeprecationWarnings (e.g. ssl.TLSVersion.TLSv1 is deprecated)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+__version__ = "1.2.0"
+REPO_SLUG = "BelisarioGM/HeadTLS"
 
 # external libs
 try:
@@ -71,6 +78,11 @@ def fetch_http_headers(url: str, timeout: int = 10) -> Dict[str, Any]:
         out["status_code"] = r.status_code
         out["final_url"] = r.url
         out["headers"] = {k.lower(): v for k, v in r.headers.items()}
+        content_type = out["headers"].get("content-type", "").lower()
+        if "text/html" in content_type:
+            out["body"] = r.text[:500000]
+        else:
+            out["body"] = ""
     except requests.exceptions.SSLError as e:
         out["error"] = f"SSL error: {e}"
     except requests.exceptions.RequestException as e:
@@ -157,20 +169,211 @@ def tls_multiport_scan(host: str, ports: List[int]) -> Dict[int, Any]:
             results[port] = {"error": str(e)}
     return results
 
-def build_report(target: str, ports: List[int]) -> Dict[str, Any]:
-    if not target.startswith(("http://", "https://")):
-        request_target = "https://" + target
-    else:
-        request_target = target
+def _normalize_target(target: str) -> str:
+    if target.startswith(("http://", "https://")):
+        return target
+    return "https://" + target
 
+def _build_request_url(target: str) -> Dict[str, Any]:
+    request_target = _normalize_target(target)
     parsed = urlparse(request_target)
-    scheme = parsed.scheme
     host = parsed.hostname
     path = parsed.path or "/"
-    url_for_http = f"{scheme}://{host}"
-    if parsed.port:
-        url_for_http += f":{parsed.port}"
-    url_for_http += path
+    if parsed.params:
+        path = f"{path};{parsed.params}"
+    url_for_http = f"{parsed.scheme}://{parsed.netloc}{path}"
+    if parsed.query:
+        url_for_http = f"{url_for_http}?{parsed.query}"
+    return {"request_target": request_target, "parsed": parsed, "host": host, "url_for_http": url_for_http}
+
+def _extract_name_version(raw: str) -> Dict[str, str]:
+    text = (raw or "").strip()
+    if not text:
+        return {"name": "", "version": ""}
+    m = re.match(r"^\s*([A-Za-z0-9._\-+ ]+?)\s*[\/ ]\s*v?(\d+(?:\.\d+){0,4})\b", text)
+    if m:
+        return {"name": m.group(1).strip(), "version": m.group(2).strip()}
+    return {"name": text, "version": ""}
+
+@dataclass
+class UpdateInfo:
+    available: bool
+    current_version: str
+    latest_version: str
+    download_url: str | None
+    details: str | None
+
+def _parse_version(v: str) -> List[int]:
+    nums = re.findall(r"\d+", v or "")
+    return [int(x) for x in nums] if nums else [0]
+
+def _is_newer(current: str, latest: str) -> bool:
+    return _parse_version(latest) > _parse_version(current)
+
+def check_for_updates(current_version: str, repo_slug: str = REPO_SLUG, timeout: int = 10) -> UpdateInfo:
+    api = f"https://api.github.com/repos/{repo_slug}/releases/latest"
+    try:
+        r = requests.get(api, timeout=timeout)
+        if r.status_code == 404:
+            return UpdateInfo(False, current_version, "", None, "No releases found on GitHub.")
+        r.raise_for_status()
+        data = r.json()
+        tag = data.get("tag_name") or data.get("name") or ""
+        latest = tag.lstrip("v")
+        assets = data.get("assets") or []
+        download = None
+        for a in assets:
+            url = a.get("browser_download_url")
+            if url:
+                download = url
+                break
+        if not download:
+            download = data.get("zipball_url")
+        if not latest:
+            return UpdateInfo(False, current_version, "", None, "Latest release tag not found.")
+        return UpdateInfo(_is_newer(current_version, latest), current_version, latest, download, None)
+    except requests.exceptions.RequestException as e:
+        return UpdateInfo(False, current_version, "", None, f"Update check failed: {e}")
+
+def download_update(download_url: str, timeout: int = 20) -> str:
+    filename = download_url.rstrip("/").split("/")[-1] or "HeadTLS-latest.zip"
+    if not re.search(r"\.(zip|tar\.gz|tgz)$", filename):
+        filename += ".zip"
+    with requests.get(download_url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(filename, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+    return filename
+
+def detect_technologies(http: Dict[str, Any]) -> List[Dict[str, str]]:
+    headers = http.get("headers", {}) or {}
+    body = http.get("body", "") or ""
+    found: List[Dict[str, str]] = []
+    seen = set()
+
+    def add_tech(raw: str, source: str) -> None:
+        parsed = _extract_name_version(raw)
+        name = parsed["name"].strip()
+        if not name:
+            return
+        version = parsed["version"]
+        key = (name.lower(), version.lower(), source.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        found.append({"name": name, "version": version, "source": source, "raw": raw})
+
+    for hdr in ("server", "x-powered-by", "x-aspnet-version", "x-generator", "via"):
+        val = headers.get(hdr)
+        if val:
+            for part in re.split(r",\s*", val):
+                if part.strip():
+                    add_tech(part.strip(), f"header:{hdr}")
+
+    meta_gen = re.findall(
+        r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']',
+        body,
+        flags=re.IGNORECASE,
+    )
+    for item in meta_gen:
+        add_tech(item, "html:meta-generator")
+
+    script_patterns = [
+        (r"wp-content|wp-includes", "WordPress"),
+        (r"jquery(?:\.min)?(?:[-.]([0-9][\w.\-]*))?\.js", "jQuery"),
+        (r"bootstrap(?:\.min)?(?:[-.]([0-9][\w.\-]*))?\.(?:css|js)", "Bootstrap"),
+        (r"react(?:\.production\.min)?\.js", "React"),
+        (r"vue(?:\.runtime)?(?:\.min)?\.js", "Vue.js"),
+        (r"angular(?:\.min)?\.js", "AngularJS"),
+    ]
+    for pattern, name in script_patterns:
+        for match in re.finditer(pattern, body, flags=re.IGNORECASE):
+            version = ""
+            if match.lastindex:
+                version = (match.group(1) or "").strip()
+            raw = f"{name} {version}".strip()
+            add_tech(raw, "html:assets")
+
+    return found
+
+def searchsploit_lookup(technologies: List[Dict[str, str]], max_results: int = 5, timeout: int = 12) -> Dict[str, Any]:
+    if not technologies:
+        return {"available": True, "queries": []}
+
+    if shutil.which("searchsploit") is None:
+        return {"available": False, "error": "searchsploit is not installed or not in PATH", "queries": []}
+
+    queries = []
+    seen = set()
+    for t in technologies:
+        name = t.get("name", "").strip()
+        version = t.get("version", "").strip()
+        if not name:
+            continue
+        query = f"{name} {version}".strip()
+        q_key = query.lower()
+        if q_key in seen:
+            continue
+        seen.add(q_key)
+
+        payload: Dict[str, Any] = {}
+        qres: Dict[str, Any] = {"query": query, "results": []}
+        try:
+            proc = subprocess.run(
+                ["searchsploit", "--disable-colour", "--json", query],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            if proc.stdout:
+                payload = json.loads(proc.stdout)
+        except subprocess.TimeoutExpired:
+            qres["error"] = "searchsploit timeout"
+        except json.JSONDecodeError:
+            qres["error"] = "invalid JSON from searchsploit"
+        except Exception as e:
+            qres["error"] = str(e)
+
+        items = payload.get("RESULTS_EXPLOIT", []) if isinstance(payload, dict) else []
+        qres["total_results"] = len(items)
+        for row in items[:max_results]:
+            qres["results"].append(
+                {
+                    "title": row.get("Title"),
+                    "edb_id": row.get("EDB-ID"),
+                    "date_published": row.get("Date_Published"),
+                    "type": row.get("Type"),
+                    "platform": row.get("Platform"),
+                    "codes": row.get("Codes"),
+                }
+            )
+        queries.append(qres)
+
+    return {"available": True, "queries": queries}
+
+def evaluate_clickjacking(headers: Dict[str, Any]) -> Dict[str, Any]:
+    xfo = (headers.get("x-frame-options") or "").strip()
+    csp = (headers.get("content-security-policy") or "").strip()
+    has_xfo = bool(xfo)
+    has_frame_ancestors = "frame-ancestors" in csp.lower()
+    vulnerable = not has_xfo and not has_frame_ancestors
+    return {
+        "vulnerable": vulnerable,
+        "x_frame_options_present": has_xfo,
+        "x_frame_options_value": xfo if has_xfo else None,
+        "csp_frame_ancestors_present": has_frame_ancestors,
+        "reason": "No X-Frame-Options and no CSP frame-ancestors directive" if vulnerable else "Framing protections detected",
+    }
+
+def build_report(target: str, ports: List[int]) -> Dict[str, Any]:
+    target_info = _build_request_url(target)
+    request_target = target_info["request_target"]
+    parsed = target_info["parsed"]
+    host = target_info["host"]
+    url_for_http = target_info["url_for_http"]
 
     http = fetch_http_headers(url_for_http)
 
@@ -182,15 +385,29 @@ def build_report(target: str, ports: List[int]) -> Dict[str, Any]:
     sec_checks = {h: headers.get(h) for h in SEC_HEADERS}
 
     cookies = parse_set_cookie(headers)
+    technologies = detect_technologies(http)
+    clickjacking = evaluate_clickjacking(headers)
+    searchsploit = searchsploit_lookup(technologies)
 
     report = {
         "scanned_target": target,
+        "normalized_target": request_target,
+        "parsed_target": {
+            "scheme": parsed.scheme,
+            "host": host,
+            "port": parsed.port,
+            "path": parsed.path or "/",
+            "query": parsed.query or "",
+        },
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "http": http,
         "tls": tls,
+        "technologies": technologies,
+        "searchsploit": searchsploit,
         "summary_checks": {
             "security_headers": sec_checks,
             "cookies": cookies,
+            "clickjacking": clickjacking,
         },
     }
     return report
@@ -201,7 +418,7 @@ def pretty_summary(report: Dict[str, Any]) -> None:
     print("=" * 71)
     print(f"Target: {host}")
     print(f"Scan time (UTC): {report['timestamp_utc']}")
-    print("Author: @BelisarioGM")
+    print(f"Author: @BelisarioGM | Version: {__version__}")
     print("=" * 71)
 
     headers = report["summary_checks"]["security_headers"]
@@ -215,6 +432,18 @@ def pretty_summary(report: Dict[str, Any]) -> None:
             print(f"{RED}{ICON_FAIL} {h} (missing){RESET}")
     if headers.get("server"):
         print(f"{ICON_INFO} Server: {headers['server']}")
+
+    print(f"\n[Clickjacking from {host}]")
+    click = report["summary_checks"].get("clickjacking", {})
+    if click.get("vulnerable"):
+        print(f"{RED}{ICON_FAIL} Potentially vulnerable to clickjacking ({click.get('reason')}){RESET}")
+    else:
+        details = []
+        if click.get("x_frame_options_present"):
+            details.append("X-Frame-Options")
+        if click.get("csp_frame_ancestors_present"):
+            details.append("CSP frame-ancestors")
+        print(f"{GREEN}{ICON_OK} Clickjacking protections present: {', '.join(details) or 'detected'}{RESET}")
 
     print(f"\n[Cookies from {host}]")
     cookies = report["summary_checks"]["cookies"]
@@ -230,6 +459,7 @@ def pretty_summary(report: Dict[str, Any]) -> None:
             else:
                 print(f"{GREEN}{ICON_OK} Secure cookie: {c['raw']}{RESET}")
 
+    legacy_tls = {"TLSv1.0", "TLSv1.1"}
     print(f"\n[TLS from {host}]")
     for port, res in report["tls"].items():
         print(f"Port {port}:")
@@ -240,11 +470,45 @@ def pretty_summary(report: Dict[str, Any]) -> None:
             print(f"  {RED}{ICON_FAIL} Error scanning TLS on port {port}{RESET}")
             continue
         for ver, detail in res.items():
-            if detail.get("ok"):
+            if ver in legacy_tls and detail.get("ok"):
+                cipher = detail.get("cipher") or detail.get("cipher_name") or "unknown"
+                print(f"  {RED}{ICON_FAIL} {ver} enabled ({cipher}) - should be disabled{RESET}")
+            elif ver in legacy_tls and not detail.get("ok"):
+                print(f"  {GREEN}{ICON_OK} {ver} disabled (required){RESET}")
+            elif detail.get("ok"):
                 cipher = detail.get("cipher") or detail.get("cipher_name") or "unknown"
                 print(f"  {GREEN}{ICON_OK} {ver} enabled ({cipher}){RESET}")
             else:
                 print(f"  {RED}{ICON_FAIL} {ver} disabled{RESET}")
+
+    print(f"\n[Technologies from {host}]")
+    techs = report.get("technologies", [])
+    if not techs:
+        print(f"{YELLOW}{ICON_WARN} No technologies detected{RESET}")
+    else:
+        for t in techs:
+            suffix = f" {t['version']}" if t.get("version") else ""
+            print(f"{ICON_INFO} {t['name']}{suffix} ({t.get('source', 'unknown')})")
+
+    print(f"\n[searchsploit from {host}]")
+    sploit = report.get("searchsploit", {})
+    if not sploit.get("available", False):
+        print(f"{YELLOW}{ICON_WARN} {sploit.get('error', 'searchsploit unavailable')}{RESET}")
+    else:
+        any_result = False
+        for q in sploit.get("queries", []):
+            if q.get("error"):
+                print(f"{YELLOW}{ICON_WARN} {q['query']}: {q['error']}{RESET}")
+                continue
+            total = q.get("total_results", 0)
+            if total <= 0:
+                continue
+            any_result = True
+            print(f"{ICON_INFO} Query: {q['query']} (total: {total}, showing: {len(q.get('results', []))})")
+            for item in q.get("results", []):
+                print(f"  - [{item.get('edb_id')}] {item.get('title')}")
+        if not any_result:
+            print(f"{GREEN}{ICON_OK} No exploit matches found in searchsploit{RESET}")
 
     print("\n" + "-" * 71)
     print(f"Summary of Findings from {host}:")
@@ -254,6 +518,8 @@ def pretty_summary(report: Dict[str, Any]) -> None:
         print(" - Missing CSP")
     if not headers.get("x-frame-options"):
         print(" - Missing X-Frame-Options")
+    if report["summary_checks"].get("clickjacking", {}).get("vulnerable"):
+        print(" - Potential clickjacking risk")
     for c in cookies:
         if (not c["secure"]) or (not c["httponly"]):
             print(" - Insecure cookies found")
@@ -267,6 +533,7 @@ def main():
     p.add_argument("-o", "--output", help="JSON output file to save results")
     p.add_argument("--summary", action="store_true", help="Show simplified summary output (default)")
     p.add_argument("--ports", default="443", help="Comma-separated list of ports to test TLS (default: 443)")
+    p.add_argument("--check-update", action="store_true", help="Check if a newer version is available on GitHub")
     args = p.parse_args()
 
     ports = [int(x.strip()) for x in args.ports.split(",") if x.strip().isdigit()]
@@ -290,6 +557,30 @@ def main():
             print(f"\nJSON saved to: {args.output}")
         except Exception as e:
             print("Error saving JSON:", e, file=sys.stderr)
+
+    if args.check_update:
+        print("\n[Update Check]")
+        info = check_for_updates(__version__, REPO_SLUG)
+        if info.details:
+            print(f"{YELLOW}{ICON_WARN} {info.details}{RESET}")
+            return
+        if info.available:
+            print(f"{YELLOW}{ICON_WARN} New version available: {info.latest_version} (current: {info.current_version}){RESET}")
+            if info.download_url:
+                try:
+                    choice = input("Download update now? [y/N]: ").strip().lower()
+                except EOFError:
+                    choice = "n"
+                if choice == "y":
+                    try:
+                        saved = download_update(info.download_url)
+                        print(f"{GREEN}{ICON_OK} Update downloaded: {saved}{RESET}")
+                    except Exception as e:
+                        print(f"{RED}{ICON_FAIL} Download failed: {e}{RESET}")
+            else:
+                print(f"{ICON_INFO} No download URL available for the latest release.")
+        else:
+            print(f"{GREEN}{ICON_OK} You are on the latest version ({info.current_version}).{RESET}")
 
 if __name__ == "__main__":
     main()

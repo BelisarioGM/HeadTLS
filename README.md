@@ -21,6 +21,11 @@ Autor: **@BelisarioGM**
   - `X-XSS-Protection`
 - Analiza cookies y muestra si carecen de flags `Secure` o `HttpOnly`.
 - Escanea los protocolos TLS soportados en un puerto (`443` por defecto).
+- Acepta objetivo como `IP`, `dominio` o **URL completa** (incluye ruta y querystring).
+- Detecta tecnologías web por headers y contenido HTML (fingerprinting básico).
+- Busca coincidencias de tecnologías detectadas en `searchsploit` (si está instalado en el sistema).
+- Evalúa exposición a **clickjacking** (`X-Frame-Options` / `CSP frame-ancestors`).
+- Permite verificar si hay una versión más reciente en GitHub y descargarla bajo demanda.
 - Genera salida:
   - **Resumen en consola** (por defecto).
   - **JSON estructurado** (si se usa `-o archivo.json`).
@@ -41,4 +46,12 @@ Ejecución:
 
 ```bash
 python headtls.py -u <IP/URL>
+```
+
+Opciones útiles:
+
+```bash
+python headtls.py -u <IP/URL> --ports 443,8443 --summary
+python headtls.py -u <IP/URL> -o output.json
+python headtls.py -u <IP/URL> --check-update
 ```
